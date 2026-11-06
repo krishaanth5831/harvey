@@ -19,8 +19,12 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/* /root/.cache
 
-# Non-root user; owns app data and the shared browser install
-RUN useradd --create-home --uid 1000 harvey \
+# Match the checkout owner on Linux; remain non-root.
+ARG HARVEY_UID=1000
+ARG HARVEY_GID=1000
+RUN test "$HARVEY_UID" -gt 0 && test "$HARVEY_GID" -gt 0 \
+    && groupadd --gid "$HARVEY_GID" harvey \
+    && useradd --create-home --uid "$HARVEY_UID" --gid "$HARVEY_GID" harvey \
     && mkdir -p /app/data \
     && chown -R harvey:harvey /app /ms-playwright
 
@@ -34,12 +38,22 @@ USER harvey
 ENV PATH="/home/harvey/.local/bin:${PATH}"
 
 # Claude Code CLI, installed as the runtime user so ~/.local/bin is correct.
-# `|| true` keeps the build working offline; the CLI is required at runtime.
-RUN curl -fsSL https://claude.ai/install.sh | sh || true
+# Download separately so fetch failures cannot be hidden by a shell pipeline.
+# Fail the build if installation or Harvey's CLI isolation check fails.
+RUN installer="$(mktemp)" \
+    && curl -fsSL https://claude.ai/install.sh -o "$installer" \
+    && bash "$installer" \
+    && rm "$installer" \
+    && python -c "from harvey.claude_runtime import check_cli; print(check_cli())"
 
-# Healthy = the heartbeat loop has touched the database recently
-# (2h window tolerates long heartbeat intervals and quiet-hour idling).
-HEALTHCHECK --interval=5m --timeout=10s --start-period=3m --retries=3 \
-    CMD python -c "import os,sys,time; p='/app/data/harvey.db'; sys.exit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p) < 7200 else 1)"
+# Healthy = the dashboard is accepting connections on its loopback port. The
+# heartbeat loop is started from the dashboard on demand, so database activity
+# is not a reliable liveness signal for the container's main process.
+HEALTHCHECK --interval=1m --timeout=10s --start-period=1m --retries=3 \
+  CMD python -c "import socket; socket.create_connection(('127.0.0.1', 5555), timeout=5).close()"
 
-CMD ["python", "-m", "harvey.main"]
+# WebUI first: `docker run` serves the dashboard; it starts/stops the
+# heartbeat loop itself. Any arguments replace the default command, so
+# `docker compose run --rm harvey setup` runs the setup wizard.
+ENTRYPOINT ["python", "-m", "harvey"]
+CMD ["dashboard"]

@@ -63,7 +63,7 @@ def _take_draft_lock(state: StateManager | None = None):
     # Next to the database in use, so a test database never fights the live one.
     path = Path(state.db_path).with_name(".draft.lock") if state and getattr(state, "db_path", "") else DRAFT_LOCK
     path.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(path, "w")
+    fh = open(path, "w", encoding="utf-8")
     try:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:

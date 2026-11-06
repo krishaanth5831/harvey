@@ -33,6 +33,7 @@ from harvey.integrations.mail_provider import (
     SendResult,
     looks_like_bounce,
 )
+from harvey.integrations.signature import SignatureError, load_signature, set_body
 
 logger = logging.getLogger("harvey.smtp")
 
@@ -66,6 +67,10 @@ class SmtpImapProvider(MailProvider):
         thread_ref: str = "",
         in_reply_to: str = "",
     ) -> SendResult:
+        try:
+            sig = load_signature(self.config)
+        except SignatureError as e:
+            return SendResult(ok=False, error=f"signature: {e}"[:300])
         persona = self.config.persona
         msg = EmailMessage()
         msg["To"] = to_email
@@ -76,7 +81,7 @@ class SmtpImapProvider(MailProvider):
         if in_reply_to:
             msg["In-Reply-To"] = in_reply_to
             msg["References"] = in_reply_to
-        msg.set_content(body)
+        set_body(msg, body, sig)
 
         try:
             await aiosmtplib.send(

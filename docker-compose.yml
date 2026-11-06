@@ -1,18 +1,29 @@
 services:
   harvey:
-    build: .
-    env_file: .env
+    build:
+      context: .
+      args:
+        HARVEY_UID: ${HARVEY_UID:-1000}
+        HARVEY_GID: ${HARVEY_GID:-1000}
+    # Supported on native Linux. Keep the dashboard's loopback-only bind.
+    network_mode: host
+    command: ["dashboard"]
     volumes:
-      # Persist database across restarts
-      - ./data:/app/data
-      # Mount config for easy editing without rebuild
-      - ./harvey.yaml:/app/harvey.yaml:ro
-      - ./prompts:/app/prompts:ro
-      - ./skills:/app/skills
-      # Mount Claude auth (required for Max plan usage).
-      # Not read-only: the CLI refreshes OAuth tokens in place.
-      # The container runs as non-root user "harvey" (uid 1000).
-      - ~/.claude:/home/harvey/.claude
+      # Mount the checkout directory, not individual config files: setup and
+      # training atomically replace files and create harvey.local.yaml.
+      # Source, configuration, knowledge, and data therefore survive recreation.
+      # Harvey reads .env itself; env_file would pin stale values at creation.
+      - type: bind
+        source: .
+        target: /app
+        bind:
+          create_host_path: false
+      # The Claude CLI refreshes OAuth tokens in place.
+      - type: bind
+        source: ${HOME}/.claude
+        target: /home/harvey/.claude
+        bind:
+          create_host_path: false
     restart: unless-stopped
     init: true
     logging:

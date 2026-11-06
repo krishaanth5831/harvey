@@ -464,6 +464,9 @@ async def test_follow_up_waits_for_first_then_threads(state):
     assert step2["status"] == "approved"
     assert datetime.fromisoformat(step2["send_at"]) > _now() - timedelta(minutes=1)
 
+    # Once step one has been out for longer than the gap, it threads on it.
+    step1 = await state.get_outbox_step("track:growers", pid, 1)
+    await state.update_outbox_item(step1["id"], sent_at=past)
     await state.update_outbox_item(step2["id"], send_at=past)
     await sender._drain_due()
     assert sender.provider.sent[-1] == ("Re: q", "<m1@v.nl>")
