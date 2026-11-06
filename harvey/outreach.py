@@ -31,8 +31,9 @@ import re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, quote_plus, urlparse
 
-import fcntl
 from pathlib import Path
+
+from harvey.pidfile import _try_lock as _try_file_lock
 
 from harvey.agents.scout import MAX_RESULTS_PER_QUERY, Scout
 from harvey.brain import Brain
@@ -64,9 +65,9 @@ def _take_draft_lock(state: StateManager | None = None):
     path = Path(state.db_path).with_name(".draft.lock") if state and getattr(state, "db_path", "") else DRAFT_LOCK
     path.parent.mkdir(parents=True, exist_ok=True)
     fh = open(path, "w", encoding="utf-8")
-    try:
-        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    # The same portable lock as the loop's PID file (fcntl, or msvcrt on
+    # Windows); the handle is released when the caller closes it.
+    if not _try_file_lock(fh):
         fh.close()
         raise DraftRunInProgress(
             "another 'harvey outreach draft' is still running; wait for it "
