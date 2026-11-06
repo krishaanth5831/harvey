@@ -301,3 +301,18 @@ def test_capability_check_is_cached_per_executable(monkeypatch, tmp_path):
     exe.write_text("v2 is longer")  # an update: checked again
     claude_runtime.check_cli()
     assert len(probes) == 2
+
+
+@pytest.mark.asyncio
+async def test_brain_claude_call_is_lean(state, monkeypatch):
+    """Own one-line system prompt and the configured effort: the fixed cost
+    per call is a few hundred tokens instead of Claude Code's full default
+    prompt, and a short draft gets no deep thinking."""
+    from harvey.config import BrainConfig
+    captured = _capture(monkeypatch)
+    await Brain(state, BrainConfig(model="sonnet", reasoning_effort="low")).think("hi")
+
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("--system-prompt") + 1] == brain_mod.LEAN_SYSTEM_PROMPT
+    assert cmd[cmd.index("--effort") + 1] == "low"
+    assert cmd[cmd.index("--model") + 1] == "sonnet"

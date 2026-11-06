@@ -286,6 +286,11 @@ class EmailChannelConfig(BaseModel):
     @classmethod
     def _blank_signature(cls, v):
         return SignatureConfig() if v is None else v
+    # The mailbox is also a person's everyday inbox (smtp provider only).
+    # Reply polling then never marks mail as read and looks only at mail
+    # from addresses Harvey has written to (plus bounces), read or not, so
+    # a reply the human opens first still stops the follow-up.
+    shared_inbox: bool = False
 
     @field_validator("max_daily_sends")
     @classmethod
@@ -335,11 +340,71 @@ class LinkedInChannelConfig(BaseModel):
     enabled: bool = False
     max_daily_connections: int = 20
     max_daily_messages: int = 10
+    # LinkedIn caps connection notes at 200 characters on free accounts
+    # (300 on Premium).
+    note_max_chars: int = 200
 
 
 class ChannelsConfig(BaseModel):
     email: EmailChannelConfig = EmailChannelConfig()
     linkedin: LinkedInChannelConfig = LinkedInChannelConfig()
+
+
+class OutreachTrack(BaseModel):
+    """One audience for track outreach (e.g. growers, investors, labs).
+
+    `harvey outreach find` runs `queries` through web search to collect
+    public LinkedIn profiles. `harvey outreach draft` writes, per person, a
+    LinkedIn connection note and first message (sent by hand) and a cold
+    email plus follow-up (queued in the outbox for approval).
+    """
+
+    label: str = ""
+    # Who fits, what the conversation is for, what to leave out. Shared by
+    # every channel and by reply drafting.
+    brief: str = ""
+    # What the connection note and the first message after accepting say.
+    linkedin: str = ""
+    # What the cold email and its follow-up say.
+    email: str = ""
+    channels: list[str] = ["linkedin", "email"]
+    # Web-search queries, e.g. 'site:linkedin.com/in teeltmanager tomaten'.
+    # Each `find` run takes the next few, round-robin, so throttled free
+    # search backends get a different query every run.
+    queries: list[str] = []
+    # Company name -> email domain, checked before searching the web for a
+    # company's site. Matches when either name contains the other.
+    domains: dict[str, str] = {}
+
+    @field_validator("channels")
+    @classmethod
+    def _known_channels(cls, v: list[str]) -> list[str]:
+        unknown = set(v) - {"linkedin", "email"}
+        if unknown:
+            raise ValueError(f"unknown channel(s): {', '.join(sorted(unknown))}")
+        return v
+
+
+class OutreachConfig(BaseModel):
+    tracks: dict[str, OutreachTrack] = {}
+    # Reject drafts with any digit in them, for senders whose house rule is
+    # no figures in outward copy. The signature and opt-out line are fixed
+    # text and are not checked.
+    forbid_digits: bool = False
+    # Days after the first email that the follow-up goes out, counted from
+    # when the first one was actually sent. 0 = no follow-up.
+    follow_up_days: int = 7
+    # Appended under every track email and reply.
+    signature: str = ""
+    # One line under the signature, by draft language ("en" is the
+    # fallback). Cold email in the EU needs a way to opt out.
+    opt_out: dict[str, str] = {
+        "en": "If you'd rather not hear from me again, just say so and I won't write again.",
+    }
+    # Track outreach replaces the upstream heartbeat. `harvey run` would
+    # prospect and email against `icp` with the generic writer, so it
+    # refuses to start while tracks exist unless this is true.
+    allow_heartbeat: bool = False
 
 
 PRECLEARED_ADDRESS_SOURCES = ("published", "bought", "scraped", "given", "unknown")
@@ -605,6 +670,9 @@ class UsageConfig(BaseModel):
 
 BRAIN_PROVIDERS = ("claude", "codex")
 CODEX_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+# Claude Code's --effort takes low|medium|high|xhigh ("minimal" is Codex only;
+# "max" is deliberately not offered: Harvey writes short texts).
+REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
 # Model names are passed to a CLI, so they must look like a model name and
 # never like a flag ("-x") or anything a shell would treat specially.
@@ -622,7 +690,7 @@ class BrainConfig(BaseModel):
 
     provider: str = "claude"
     model: str = ""  # empty = the provider's own default
-    reasoning_effort: str = ""  # codex only; empty = model default
+    reasoning_effort: str = ""  # empty = model default (claude: --effort, codex: reasoning)
 
     @field_validator("provider", mode="before")
     @classmethod
@@ -647,10 +715,10 @@ class BrainConfig(BaseModel):
     @classmethod
     def _valid_effort(cls, v) -> str:
         v = str(v or "").strip().lower()
-        if v and v not in CODEX_REASONING_EFFORTS:
+        if v and v not in REASONING_EFFORTS:
             raise ValueError(
                 f"'{v}' is not a valid reasoning effort. "
-                f"Use one of: {', '.join(CODEX_REASONING_EFFORTS)}."
+                f"Use one of: {', '.join(REASONING_EFFORTS)}."
             )
         return v
 
@@ -726,6 +794,7 @@ class HarveyConfig(BaseModel):
     # The file it was loaded from, so a running Harvey can re-read the
     # sending mode from that same file (refresh_sending_mode).
     _source_path: str | None = PrivateAttr(default=None)
+    outreach: OutreachConfig = OutreachConfig()
 
 
 class EnvConfig(BaseModel):

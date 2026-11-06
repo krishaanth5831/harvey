@@ -529,6 +529,8 @@ class Handler:
         self.provider = get_mail_provider(config, env)
         self.skills = ""
         self.last_read_problem = ""   # why the last mailbox read failed, for the heartbeat
+        # House-rule breaks left in the reply being queued (track prospects).
+        self._reply_issues: list[str] = []
 
     @property
     def is_native(self) -> bool:
@@ -999,7 +1001,15 @@ class Handler:
 
         self.last_read_problem = ""
         try:
-            inbound = await self.provider.get_replies()
+            if (getattr(self.config.channels.email, "shared_inbox", False)
+                    and self.provider.name == "smtp"):
+                # Someone's everyday inbox: look only at mail from people
+                # Harvey wrote to (and bounces), read or unread.
+                senders = await self.state.get_sent_recipients()
+                inbound = (await self.provider.get_replies(senders=senders)
+                           if senders else [])
+            else:
+                inbound = await self.provider.get_replies()
         except Exception as e:
             logger.error(f"Handler: fetching replies failed: {e}")
             # Kept for the heartbeat: sending is held, and Today says why.
@@ -1059,6 +1069,23 @@ class Handler:
         if outbox_item:
             prospect = await self.state.get_prospect(outbox_item["prospect_id"])
 
+        if getattr(self.config.channels.email, "shared_inbox", False):
+            # An everyday inbox also gets the human's own bounces, and
+            # delivery reports rarely carry In-Reply-To: match on the
+            # failed address named in the report, and ignore the rest.
+            if prospect is None:
+                text = f"{msg.subject}\n{msg.body}".lower()
+                for address in await self.state.get_sent_recipients():
+                    if address and address.lower() in text:
+                        prospect = await self.state.get_prospect_by_email(address)
+                        break
+            if prospect is None:
+                logger.info(
+                    f"Handler: bounce '{msg.subject[:60]}' isn't about mail "
+                    "Harvey sent; ignored."
+                )
+                return
+
         if prospect:
             await self.state.update_prospect_email(
                 prospect.id, prospect.email, "invalid"
@@ -1106,6 +1133,10 @@ class Handler:
         require_approval = getattr(
             self.config.channels.email, "require_approval", True
         )
+        issues = getattr(self, "_reply_issues", None) or []
+        self._reply_issues = []
+        if issues:
+            require_approval = True  # a rule break never sends unseen
         # The first reply since you undid their opt-out waits for you, even
         # on autopilot: the undo panel promises it.
         review_key = REVIEW_NEXT_REPLY_KEY + prospect.id
@@ -1129,6 +1160,10 @@ class Handler:
             in_reply_to=reply_meta.get("message_id", ""),
             approved_by="" if require_approval else "autopilot",
         )
+        if item_id and issues:
+            await self.state.update_outbox_item(
+                item_id, error="fix before approving: " + "; ".join(issues)[:280]
+            )
         if item_id:
             await self.state.delete_setting(review_key)
             mode = "queued for your approval" if require_approval else "queued to send"
@@ -1267,6 +1302,10 @@ Product: {self.config.product.name} — {self.config.product.description}"""
             playbook = self.brain.load_skill("selling_to_startups")
             if playbook:
                 prompt += "\n\nSELLING TO STARTUP FOUNDERS\n" + playbook
+        # Track outreach (growers, investors, ...): the track's brief and
+        # house rules decide what the reply may say.
+        from harvey.outreach import reply_context
+        prompt += reply_context(self.config, prospect)
 
         prompt += f"""
 
@@ -1333,4 +1372,22 @@ Write a reply that:"""
             self.brain, [{"subject": "", "body": response}], agent="handler",
             enabled=humanizer_enabled(self.config),
         )
-        return polished[0]["body"]
+        response = polished[0]["body"]
+        # Track prospects: the same deterministic house rules as the
+        # drafts, one retry, and anything left is shown at approval.
+        from harvey.outreach import reply_issues, reply_signature
+        issues = reply_issues(self.config, prospect, response)
+        if issues:
+            retry = await self.brain.think(
+                prompt + "\n\nYour previous reply broke these rules; fix every "
+                "one:\n" + "\n".join(f"- {i}" for i in issues)
+                + f"\nPrevious reply:\n{response}",
+                session_id="harvey-handler", agent="handler",
+                task="regenerate_response",
+            )
+            if retry and retry.strip():
+                response = retry.strip()
+                issues = reply_issues(self.config, prospect, response)
+        self._reply_issues = issues
+        signature = reply_signature(self.config, prospect)
+        return f"{response}\n\n{signature}" if signature else response

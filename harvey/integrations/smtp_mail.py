@@ -10,7 +10,9 @@ a Google Workspace account with an app password, or self-hosted mail.
     SMTP_PASSWORD=        IMAP_PASSWORD=   (defaults to SMTP_PASSWORD)
 
 Sends as the configured persona (name + email). IMAP polling fetches
-UNSEEN inbox messages and marks them seen after retrieval.
+UNSEEN inbox messages and marks them seen after retrieval, or, for a shared
+everyday inbox (channels.email.shared_inbox), reads recent mail from the
+people Harvey wrote to without touching any flags.
 """
 
 import asyncio
@@ -18,12 +20,14 @@ import email
 import email.policy
 import imaplib
 import logging
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import make_msgid, parseaddr
 
 import aiosmtplib
 
 from harvey.integrations.mail_provider import (
+    BOUNCE_SENDERS,
     InboundMessage,
     MailProvider,
     SendResult,
@@ -32,6 +36,10 @@ from harvey.integrations.mail_provider import (
 from harvey.integrations.signature import SignatureError, load_signature, set_body
 
 logger = logging.getLogger("harvey.smtp")
+
+# How far back a shared-inbox poll looks; replies are deduped by id, so
+# this only needs to outlast the gap between polls.
+SHARED_INBOX_DAYS = 21
 
 
 class SmtpImapProvider(MailProvider):
@@ -91,26 +99,58 @@ class SmtpImapProvider(MailProvider):
             return SendResult(ok=False, error=str(e)[:300])
         return SendResult(ok=True, message_id=message_id, thread_ref=message_id)
 
-    async def get_replies(self, limit: int = 50) -> list[InboundMessage]:
+    async def get_replies(
+        self, limit: int = 50, senders: list[str] | None = None
+    ) -> list[InboundMessage]:
+        """Unread mail (marked read once fetched), or with `senders` (a
+        shared, everyday inbox) recent mail from those addresses and from
+        bounce daemons, read or not, fetched read-only so no flag changes."""
         loop = asyncio.get_event_loop()
         try:
-            return await loop.run_in_executor(None, self._fetch_unseen, limit)
+            return await loop.run_in_executor(
+                None, self._fetch_messages, limit, senders
+            )
         except Exception as e:
             logger.error(f"IMAP fetch failed: {e}")
             return []
 
-    def _fetch_unseen(self, limit: int) -> list[InboundMessage]:
+    @staticmethod
+    def _or_from(addresses: list[str]) -> str:
+        """IMAP SEARCH for mail from any of `addresses`: OR is binary, so
+        nest it: OR FROM a OR FROM b FROM c."""
+        terms = [f'FROM "{a}"' for a in addresses]
+        query = terms[-1]
+        for term in reversed(terms[:-1]):
+            query = f"OR {term} {query}"
+        return query
+
+    def _search_ids(self, conn, senders: list[str] | None) -> list[bytes]:
+        if senders is None:
+            status, data = conn.search(None, "UNSEEN")
+            return data[0].split() if status == "OK" and data else []
+        since = (datetime.now(timezone.utc) - timedelta(days=SHARED_INBOX_DAYS))
+        since_s = since.strftime("%d-%b-%Y")
+        addresses = sorted({a.strip().lower() for a in senders if a and '"' not in a})
+        addresses += list(BOUNCE_SENDERS)
+        ids: set[bytes] = set()
+        # Chunked so no single SEARCH line grows past what servers accept.
+        for i in range(0, len(addresses), 20):
+            chunk = addresses[i:i + 20]
+            status, data = conn.search(None, f"(SINCE {since_s} {self._or_from(chunk)})")
+            if status == "OK" and data and data[0]:
+                ids.update(data[0].split())
+        return sorted(ids, key=int)
+
+    def _fetch_messages(self, limit: int, senders: list[str] | None) -> list[InboundMessage]:
         out: list[InboundMessage] = []
         conn = imaplib.IMAP4_SSL(self.imap_host, self.imap_port)
         try:
             conn.login(self.imap_user, self.imap_pass)
-            conn.select("INBOX")
-            status, data = conn.search(None, "UNSEEN")
-            if status != "OK":
-                return []
-            ids = data[0].split()[-limit:]
+            shared = senders is not None
+            conn.select("INBOX", readonly=shared)
+            ids = self._search_ids(conn, senders)[-limit:]
             for msg_id in ids:
-                status, parts = conn.fetch(msg_id, "(RFC822)")
+                status, parts = conn.fetch(msg_id, "(BODY.PEEK[])" if shared else "(RFC822)")
                 if status != "OK" or not parts or not isinstance(parts[0], tuple):
                     continue
                 parsed = self._parse_rfc822(parts[0][1])

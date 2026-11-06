@@ -667,6 +667,22 @@ brain:
   reasoning_effort: ""   # optional: minimal | low | medium | high | xhigh
 ```
 
+**Keeping Claude usage low.** Every Claude call is lean on purpose: Harvey
+replaces Claude Code's default system prompt (tool manuals, your CLAUDE.md,
+memory and skills, about 13k tokens) with one line, loads no settings sources
+and writes no session file, so a call costs a few hundred fixed input tokens.
+To spend less of your plan on drafting, set a smaller model and a low effort;
+`reasoning_effort` applies to Claude as `--effort`:
+
+```yaml
+brain:
+  model: sonnet
+  reasoning_effort: low   # thinking counts as output tokens; low cuts it most
+```
+
+Only one `harvey outreach draft` runs at a time (a lock file in `data/`); a
+second one would draft the same people again and pay twice.
+
 What to know:
 
 - **It's one or the other.** Harvey uses exactly the provider you configure. If Codex fails, the call fails with a clear log message; it never falls back to Claude (or to an API key). A Codex-only machine doesn't need Claude installed.

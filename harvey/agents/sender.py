@@ -927,6 +927,20 @@ class Sender:
                 outside_window += 1
                 continue
 
+            # A follow-up goes in its predecessor's thread. (_follow_up_order
+            # above already made sure that email went out first.)
+            if (item["kind"] == "sequence" and int(item["step"]) > 1
+                    and not item.get("in_reply_to")):
+                prior = await self.state.get_previous_step(item)
+                if prior is not None and prior.get("message_id"):
+                    # Stored, not just set here: the row is re-read before
+                    # the send.
+                    await self.state.update_outbox_item(
+                        item["id"], in_reply_to=prior.get("message_id", ""),
+                        thread_ref=prior.get("thread_ref", ""))
+                    item = dict(item, in_reply_to=prior.get("message_id", ""),
+                                thread_ref=prior.get("thread_ref", ""))
+
             # Optional compliance check (compliance.precleared): one per
             # address, before the first cold email. Replies are never checked.
             receipt_id = ""
@@ -1063,6 +1077,11 @@ class Sender:
             )
             if prospect.status in ("new", "queued"):
                 await self.state.update_prospect_status(prospect.id, "contacted")
+            if item["kind"] == "sequence" and item["campaign_id"]:
+                await self.state.delay_later_steps(
+                    item["campaign_id"], item["prospect_id"], int(item["step"]),
+                    sent_at=now_iso, scheduled_at=item.get("send_at") or now_iso,
+                )
 
             # A sent reply belongs in its conversation thread.
             if item["kind"] == "reply" and item.get("conversation_id"):

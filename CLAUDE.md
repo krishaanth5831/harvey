@@ -303,7 +303,7 @@ Users will come back with questions and tasks. Common ones:
 - **Heartbeat loop** (`main.py`): Every cycle → check quiet hours → check budget → decide → act → log → sleep
 - **Brain** (`brain.py`): Wraps `claude -p --output-format json --dangerously-skip-permissions` for headless Claude calls; records exact per-call token usage into `usage_events`
 - **State** (`state.py`): SQLite at `data/harvey.db` with tables for companies, prospects, campaigns, conversations, actions, usage
-- **Usage tracking** (`usage.py`, `integrations/quota.py`): per-call attribution (agent/task/model/tokens) for Harvey's OWN Claude calls only — it never scans your other Claude Code sessions — plus a live subscription-quota gauge read the same way Claude Code's `/usage` does. The budget check throttles Harvey against real quota utilization so it always leaves headroom for your own interactive Claude use (`usage.max_daily_claude_percent`). Dashboard has a Usage tab; CLI has `harvey usage`.
+- **Usage tracking** (`usage.py`, `integrations/quota.py`): per-call attribution (agent/task/model/tokens) for Harvey's OWN Claude calls only — it never scans your other Claude Code sessions — plus a live subscription-quota gauge read the same way Claude Code's `/usage` does. The budget check throttles Harvey against real quota utilization so it always leaves headroom for your own interactive Claude use (`usage.max_daily_claude_percent`). Dashboard has a Usage tab; CLI has `harvey usage`. Calls are lean (own one-line `--system-prompt`, `--setting-sources ""`, no session file: ~600 fixed input tokens instead of ~13k) and `brain.reasoning_effort` is passed to Claude as `--effort`; `brain.model: sonnet` + `reasoning_effort: low` is the cheap drafting setup. One draft run at a time (`data/.draft.lock`).
 - **Skills** (`skills/`): Markdown knowledge files injected into agent prompts
 - **Signals** (`signals.py`, `state.py`): every fact Harvey learns is an OBSERVATION — a row in `observations`, never a column. A new signal needs no migration, re-observing over time is a free time series, and confidence + provenance travel with the fact. The vocabulary in `signal_codes` is governed (a trigger rejects any code not in it) and gated: only `status = 'confirmed'` signals are collected, and only a human sets that. `state.cohort(require, exclude)` does the set intersection in SQL.
 - **Dashboard** (`dashboard.py` + `harvey/web/`): FastAPI JSON API plus plain HTML/CSS/JS served from disk — no build step. Edit `harvey/web/app.css` or `app.js` and reload the page.
@@ -342,7 +342,34 @@ harvey discover              # Find businesses; --providers / --estimate / --pro
 harvey sending pause|resume  # Kill switch for all outbound
 harvey warmup [domain]       # Sending-domain readiness: SPF/DKIM/DMARC, age, blocklists, ramp, TrulyInbox warmup
 harvey trulyinbox [connect|other]  # Warmup service: connect TrulyInbox, or record another service
+harvey outreach find         # Search public LinkedIn profiles per track (outreach.tracks)
+harvey outreach draft        # Fit check + LinkedIn note/message + email/follow-up per person (--max N)
+harvey outreach list         # Drafts: LinkedIn to send BY HAND, email text and address state
+harvey outreach mark <id> sent|replied|skipped   # LinkedIn; 'replied' also cancels queued email
+harvey outreach addresses    # Company domain → one verified address per person (needs a verifier key)
+harvey outreach queue        # Clean drafts with a verified address → outbox (pending_review)
+harvey outreach send         # Poll replies/bounces, then send APPROVED, due mail
+harvey outreach run          # find + draft + addresses + queue in one go (never sends)
+harvey outreach test         # Mailbox login (SMTP + IMAP), search and verifier keys
+harvey outreach export       # Everything → outreach_drafts.csv
 ```
+
+**Track outreach.** `harvey/outreach.py` runs named audiences ("tracks", in
+`outreach.tracks` of the config): each has a `brief` (who fits, what to say, what to
+leave out), `linkedin` and `email` guidance, `channels`, search `queries` and an
+optional company → `domains` map. People come from web search (Serper if
+`SERPER_API_KEY` is set, else DuckDuckGo, which throttles after a few queries) and are
+stored with prospect status `track`, which the upstream pipeline ignores. One model
+call per person writes every channel; deterministic checks (length, digits when
+`outreach.forbid_digits`, dashes, banned phrases, links) run on each draft, with one
+retry, and drafts that still break a rule are held. LinkedIn is never automated: a human
+sends each note. Email goes through the normal outbox: step one now, the follow-up
+`follow_up_days` later (it waits for step one, threads under it and keeps its gap if
+step one was approved late), the signature and a per-language opt-out line appended.
+Replies to track prospects are drafted from the track brief, signed, and wait for
+approval. `channels.email.shared_inbox: true` (smtp) reads replies from the people
+written to without marking anything read. While tracks exist, `harvey run` refuses to
+start (`outreach.allow_heartbeat`), because the heartbeat would email against `icp`.
 
 ### Common Issues
 - **"command not found: harvey"**: Activate venv first: `source .venv/bin/activate`

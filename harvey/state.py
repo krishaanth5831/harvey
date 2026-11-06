@@ -519,7 +519,45 @@ MIGRATIONS: list[str] = [
     -- knows about the recipient. Empty until then.
     ALTER TABLE prospects ADD COLUMN timezone TEXT DEFAULT '';
     """,
+    # ── v15: track outreach — one draft row per person, both channels ──
+    """
+    -- LinkedIn note + first message (a human sends them) and the email +
+    -- follow-up (queued to the outbox) for one prospect on a track.
+    -- status is the LinkedIn status: draft → sent → replied, or skipped /
+    -- unfit. email_state: '' (address not looked up) → found | no_company
+    -- | no_domain | no_address → queued. issues / email_issues list rule
+    -- breaks the drafter couldn't fix. Databases from before this merge
+    -- already have the table, hence IF NOT EXISTS.
+    CREATE TABLE IF NOT EXISTS outreach_drafts (
+        id TEXT PRIMARY KEY,
+        prospect_id TEXT UNIQUE REFERENCES prospects(id),
+        track TEXT DEFAULT '',
+        language TEXT DEFAULT '',
+        connect_note TEXT DEFAULT '',
+        first_message TEXT DEFAULT '',
+        fit_reason TEXT DEFAULT '',
+        issues TEXT DEFAULT '',
+        status TEXT DEFAULT 'draft',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        email_subject TEXT DEFAULT '',
+        email_body TEXT DEFAULT '',
+        followup_body TEXT DEFAULT '',
+        email_issues TEXT DEFAULT '',
+        email_state TEXT DEFAULT '',
+        email_domain TEXT DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_outreach_drafts_status ON outreach_drafts(status);
+    CREATE INDEX IF NOT EXISTS idx_outreach_drafts_email_state
+        ON outreach_drafts(email_state);
+
+    -- Track prospects were saved as 'linkedin'; they now feed both channels.
+    UPDATE prospects SET status = 'track' WHERE status = 'linkedin';
+    """,
 ]
+
+LINKEDIN_DRAFT_STATUSES = ("draft", "sent", "replied", "skipped", "unfit")
+EMAIL_DRAFT_STATES = ("", "found", "no_company", "no_domain", "no_address", "queued")
 
 BRAIN_PROVIDERS = ("claude", "codex")
 _USAGE_LOG_COLUMN = {"claude": "claude_calls", "codex": "codex_calls"}
@@ -1177,7 +1215,7 @@ class StateManager:
                 return dict(row) if row else None
 
     _OUTBOX_COLUMNS = frozenset({
-        "status", "error", "message_id", "thread_ref", "sent_at",
+        "status", "error", "message_id", "thread_ref", "in_reply_to", "sent_at",
         "subject", "body", "send_at", "provider",
     })
 
@@ -2165,6 +2203,210 @@ class StateManager:
             ) as cursor:
                 rows = await cursor.fetchall()
                 return {row[0]: row[1] for row in rows}
+
+    # ── Track outreach drafts (LinkedIn sent by hand, email via the outbox) ──
+
+    async def prospects_needing_draft(
+        self, track: str | None = None, limit: int = 10
+    ) -> list[Prospect]:
+        """Track prospects (status 'track') with no draft yet. The track
+        lives in `industry`, set when `harvey outreach find` saved them."""
+        sql = """SELECT p.* FROM prospects p
+                 LEFT JOIN outreach_drafts d ON d.prospect_id = p.id
+                 WHERE p.status = 'track' AND d.id IS NULL"""
+        params: list = []
+        if track:
+            sql += " AND p.industry = ?"
+            params.append(track)
+        sql += " ORDER BY p.created_at ASC LIMIT ?"
+        params.append(int(limit))
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, params) as cursor:
+                rows = await cursor.fetchall()
+                return [self._prospect_from_row(r) for r in rows]
+
+    async def add_outreach_draft(
+        self,
+        *,
+        prospect_id: str,
+        track: str,
+        language: str = "",
+        connect_note: str = "",
+        first_message: str = "",
+        fit_reason: str = "",
+        issues: str = "",
+        status: str = "draft",
+        email_subject: str = "",
+        email_body: str = "",
+        followup_body: str = "",
+        email_issues: str = "",
+    ) -> str | None:
+        """Store one prospect's draft. None if that prospect already has one."""
+        draft_id = _new_id()
+        now = _utcnow().isoformat()
+        async with self._connect() as db:
+            cursor = await db.execute(
+                """INSERT OR IGNORE INTO outreach_drafts
+                   (id, prospect_id, track, language, connect_note,
+                    first_message, fit_reason, issues, status,
+                    email_subject, email_body, followup_body, email_issues,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (draft_id, prospect_id, track, language, connect_note,
+                 first_message, fit_reason, issues, status,
+                 email_subject, email_body, followup_body, email_issues,
+                 now, now),
+            )
+            await db.commit()
+            return draft_id if cursor.rowcount > 0 else None
+
+    async def update_outreach_draft(self, draft_id: str, **fields) -> bool:
+        allowed = {"language", "connect_note", "first_message", "fit_reason",
+                   "issues", "email_subject", "email_body", "followup_body",
+                   "email_issues", "email_state", "email_domain"}
+        bad = set(fields) - allowed
+        if bad:
+            raise ValueError(f"not draft fields: {', '.join(sorted(bad))}")
+        if "email_state" in fields and fields["email_state"] not in EMAIL_DRAFT_STATES:
+            raise ValueError(f"unknown email_state '{fields['email_state']}'")
+        if not fields:
+            return False
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        async with self._connect() as db:
+            cursor = await db.execute(
+                f"UPDATE outreach_drafts SET {sets}, updated_at = ? WHERE id = ?",
+                (*fields.values(), _utcnow().isoformat(), draft_id),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def get_outreach_drafts(
+        self,
+        status: str | None = None,
+        track: str | None = None,
+        email_state: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """Drafts joined with who they're for, oldest first. Unfit rows
+        are only returned when asked for by status."""
+        sql = """SELECT d.*, p.first_name, p.last_name, p.title, p.company,
+                        p.linkedin_url, p.source_url, p.email, p.email_status,
+                        p.status AS prospect_status
+                 FROM outreach_drafts d JOIN prospects p ON p.id = d.prospect_id
+                 WHERE 1 = 1"""
+        params: list = []
+        if status:
+            sql += " AND d.status = ?"
+            params.append(status)
+        if track:
+            sql += " AND d.track = ?"
+            params.append(track)
+        if email_state is not None:
+            sql += " AND d.email_state = ? AND d.status != 'unfit'"
+            params.append(email_state)
+        sql += " ORDER BY d.created_at ASC LIMIT ?"
+        params.append(int(limit))
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, params) as cursor:
+                return [dict(r) for r in await cursor.fetchall()]
+
+    async def get_outreach_draft(self, draft_id: str) -> dict | None:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM outreach_drafts WHERE id = ?", (draft_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def set_linkedin_draft_status(self, draft_id: str, status: str) -> bool:
+        if status not in LINKEDIN_DRAFT_STATUSES:
+            raise ValueError(
+                f"status must be one of {', '.join(LINKEDIN_DRAFT_STATUSES)}"
+            )
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE outreach_drafts SET status = ?, updated_at = ? WHERE id = ?",
+                (status, _utcnow().isoformat(), draft_id),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def count_outreach_drafts(self) -> dict[str, dict[str, int]]:
+        """{'linkedin': {status: n}, 'email': {email_state: n}} over fit drafts
+        (unfit is counted under linkedin only)."""
+        out: dict[str, dict[str, int]] = {"linkedin": {}, "email": {}}
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT status, COUNT(*) FROM outreach_drafts GROUP BY status"
+            ) as cursor:
+                out["linkedin"] = {r[0]: r[1] for r in await cursor.fetchall()}
+            async with db.execute(
+                "SELECT email_state, COUNT(*) FROM outreach_drafts "
+                "WHERE status != 'unfit' GROUP BY email_state"
+            ) as cursor:
+                out["email"] = {(r[0] or "not looked up"): r[1]
+                                for r in await cursor.fetchall()}
+        return out
+
+    async def get_outbox_step(
+        self, campaign_id: str, prospect_id: str, step: int
+    ) -> dict | None:
+        """One sequence step's outbox row, or None."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM outbox WHERE campaign_id = ? AND prospect_id = ? "
+                "AND step = ? AND kind = 'sequence'",
+                (campaign_id, prospect_id, int(step)),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def delay_later_steps(
+        self, campaign_id: str, prospect_id: str, step: int,
+        sent_at: str, scheduled_at: str,
+    ) -> int:
+        """A step went out later than scheduled (approved late): push the
+        prospect's unsent later steps back by the same amount, so the gap
+        between emails stays what the sequence intended."""
+        try:
+            lag = (datetime.fromisoformat(sent_at)
+                   - datetime.fromisoformat(scheduled_at))
+        except ValueError:
+            return 0
+        if lag.total_seconds() <= 0:
+            return 0
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT id, send_at FROM outbox WHERE campaign_id = ? "
+                "AND prospect_id = ? AND step > ? AND kind = 'sequence' "
+                "AND status IN ('pending_review', 'approved')",
+                (campaign_id, prospect_id, int(step)),
+            ) as cursor:
+                rows = await cursor.fetchall()
+            for row in rows:
+                try:
+                    new_at = datetime.fromisoformat(row["send_at"]) + lag
+                except (TypeError, ValueError):
+                    continue
+                await db.execute(
+                    "UPDATE outbox SET send_at = ?, updated_at = ? WHERE id = ?",
+                    (new_at.isoformat(), _utcnow().isoformat(), row["id"]),
+                )
+            await db.commit()
+            return len(rows)
+
+    async def get_sent_recipients(self) -> list[str]:
+        """Every address Harvey has sent mail to."""
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT DISTINCT to_email FROM outbox WHERE status = 'sent'"
+            ) as cursor:
+                return [r[0] for r in await cursor.fetchall() if r[0]]
 
     # ── Feedback ──
 

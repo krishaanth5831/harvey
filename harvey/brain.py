@@ -30,6 +30,17 @@ DEFAULT_MAX_RETRIES = 2  # retries on transient failures (non-zero exit, timeout
 RETRY_BASE_DELAY = 5.0  # seconds; doubles per attempt
 KILL_REAP_SECONDS = 10.0  # waiting for a killed child on shutdown
 
+# Harvey's prompts are self-contained, so the Claude Code default system
+# prompt (tool manuals, environment, the operator's CLAUDE.md, memory and
+# skills: ~13k tokens per call) is replaced by this one line, and no
+# settings sources are loaded. Measured: ~600 fixed input tokens per call
+# instead of ~13,000, same answers.
+LEAN_SYSTEM_PROMPT = (
+    "You are Harvey's writing brain. Answer the prompt directly and return "
+    "exactly the format it asks for, with no preamble."
+)
+CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh")
+
 # stderr fragments that indicate retrying is pointless
 _NON_RETRYABLE_PATTERNS = (
     "not logged in",
@@ -284,6 +295,12 @@ class Brain:
         # The prompt always travels on stdin: argv is visible to other local
         # users, Windows caps it at ~32k chars, and .cmd shims re-parse it.
         cmd = claude_runtime.build_command(executable, self.model, session_id)
+        # Harvey's prompts are self-contained: one short system prompt
+        # instead of Claude Code's default (~13k tokens per call), and
+        # a low effort for short drafts (thinking is billed as output).
+        cmd += ["--system-prompt", LEAN_SYSTEM_PROMPT]
+        if self.config.reasoning_effort in CLAUDE_EFFORTS:
+            cmd += ["--effort", self.config.reasoning_effort]
 
         logger.debug(f"Brain call (session={session_id}): {prompt[:100]}...")
 
@@ -718,7 +735,7 @@ class Brain:
             "writer": ["email_frameworks", "signal_playbook", "sales_methodology", "offer_strategy", "product_knowledge", "competitive_intel"],
             "handler": ["objection_handling", "sales_methodology", "offer_strategy", "product_knowledge", "competitive_intel"],
             "sender": ["email_frameworks", "product_knowledge"],
-            "linkedin": ["linkedin_outreach", "prospecting_tactics", "product_knowledge"],
+            "outreach": ["product_knowledge", "competitive_intel"],
         }
 
         skill_names = skill_map.get(agent_name, [])
