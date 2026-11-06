@@ -59,9 +59,11 @@ class DraftRunInProgress(RuntimeError):
     pass
 
 
-def _take_draft_lock():
-    DRAFT_LOCK.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(DRAFT_LOCK, "w")
+def _take_draft_lock(state: StateManager | None = None):
+    # Next to the database in use, so a test database never fights the live one.
+    path = Path(state.db_path).with_name(".draft.lock") if state and getattr(state, "db_path", "") else DRAFT_LOCK
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(path, "w")
     try:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -527,6 +529,20 @@ Return JSON:
 {{{", ".join(keys)}}}"""
 
 
+_SIGNOFF_RE = re.compile(
+    r"\n+\s*(?:(?:best|thanks|kind regards|cheers|groet(?:en)?|met vriendelijke groet),?\s*)?{name}\s*$",
+    re.I)
+
+
+def _strip_signoff(text: str, first_name: str) -> str:
+    """The signature is appended on send, so a sign-off the model added
+    anyway ("Krishaanth" on its own line) would double it."""
+    if not text or not first_name:
+        return text or ""
+    pat = _SIGNOFF_RE.pattern.replace("{name}", re.escape(first_name))
+    return re.sub(pat, "", text, flags=re.I).rstrip()
+
+
 def _check(draft: dict, config: HarveyConfig, channels: list[str]) -> tuple[list[str], list[str]]:
     """(linkedin issues, email issues) for the channels drafted."""
     o = config.outreach
@@ -585,7 +601,7 @@ async def draft_messages(
     tracks = select_tracks(config, track)
     skills = brain.load_skills_for_agent("outreach")
     counts = {"drafted": 0, "flagged": 0, "unfit": 0, "failed": 0}
-    lock = _take_draft_lock()
+    lock = _take_draft_lock(state)
     try:
         return await _draft_loop(state, brain, config, tracks, skills, counts, track, limit)
     finally:
@@ -600,11 +616,19 @@ async def _draft_loop(state, brain, config, tracks, skills, counts, track, limit
         if spec is None:
             continue
         worked += 1
+        channels = list(spec.channels)
+        if "email" in channels and not (prospect.email or _known_domain(spec, prospect.company or "")):
+            # No address and no known company domain: nothing to send the
+            # email to, so don't pay for drafting one. LinkedIn only.
+            channels.remove("email")
         draft, li_issues, em_issues = await _draft_one(
-            brain, config, skills, name, spec, prospect, spec.channels)
+            brain, config, skills, name, spec, prospect, channels)
         if draft is None:
             counts["failed"] += 1
             continue
+        for key in ("email_body", "followup_body", "first_message"):
+            if isinstance(draft.get(key), str):
+                draft[key] = _strip_signoff(draft[key], config.persona.name.split()[0])
         if draft.get("fit") is False:
             await state.add_outreach_draft(
                 prospect_id=prospect.id, track=name,
@@ -640,6 +664,10 @@ async def _draft_loop(state, brain, config, tracks, skills, counts, track, limit
             continue
         prospect = await state.get_prospect(row["prospect_id"])
         if prospect is None:
+            continue
+        if not (prospect.email or _known_domain(spec, prospect.company or "")):
+            # Still no address: no email draft. Once an address is stored,
+            # the next run writes the email here.
             continue
         worked += 1
         draft, _, em_issues = await _draft_one(

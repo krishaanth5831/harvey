@@ -212,9 +212,10 @@ class FakeBrain:
         return self.replies.pop(0) if self.replies else None
 
 
-async def _add(state, slug, track="growers", company="Lans Tomaten"):
+async def _add(state, slug, track="growers", company="Lans Tomaten", email=""):
     return await state.add_prospect(Prospect(
         first_name="Jan", last_name=slug, title="Teeltmanager", company=company,
+        email=email,
         linkedin_url=f"https://www.linkedin.com/in/{slug}",
         source=f"linkedin_search:{track}",
         source_url=f"https://nl.linkedin.com/in/{slug}",
@@ -231,7 +232,7 @@ GOOD = {"fit": True, "reason": "grower", "language": "nl",
 
 @pytest.mark.asyncio
 async def test_draft_messages_writes_both_channels(state):
-    await _add(state, "a")
+    await _add(state, "a", email="jan@lans.nl")  # an address: the email channel is drafted
     brain = FakeBrain([GOOD])
     counts = await ld.draft_messages(state, brain, _config())
     assert counts["drafted"] == 1
@@ -279,7 +280,7 @@ async def test_draft_messages_unfit_and_failed(state):
 
 @pytest.mark.asyncio
 async def test_draft_backfills_email_for_old_linkedin_drafts(state):
-    pid = await _add(state, "a")
+    pid = await _add(state, "a", email="jan@lans.nl")  # an address was found since
     await state.add_outreach_draft(prospect_id=pid, track="growers",
                                    connect_note="n", first_message="m")
     brain = FakeBrain([GOOD])
@@ -585,3 +586,17 @@ async def test_shared_inbox_bounce_matched_by_address_or_ignored(state):
         is_bounce=True))
     assert (await state.get_prospect(pid)).email_status == "invalid"
     assert (await state.get_outbox_step("track:growers", pid, 2))["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_no_address_no_email_draft(state):
+    """No address and no known company domain: LinkedIn only, no email text
+    is asked for or stored (the user's rule: no email on file, no draft)."""
+    await _add(state, "b", company="Unknown Nursery")
+    brain = FakeBrain([{k: v for k, v in GOOD.items()
+                        if k not in ("email_subject", "email_body", "followup_body")}])
+    counts = await ld.draft_messages(state, brain, _config())
+    assert counts["drafted"] == 1
+    assert "email guidance" not in brain.prompts[-1]
+    d = (await state.get_outreach_drafts())[0]
+    assert d["connect_note"] and not d["email_body"]
