@@ -49,3 +49,26 @@ async def test_brain_runs_claude_with_no_tools(state, monkeypatch):
     assert cmd[cmd.index("--tools") + 1] == ""
     assert "--strict-mcp-config" in cmd
     assert "--allowedTools" not in cmd and "--allowed-tools" not in cmd
+
+
+@pytest.mark.asyncio
+async def test_brain_claude_call_is_lean(state, monkeypatch):
+    """Own one-line system prompt, no settings sources, no session file,
+    and the configured effort: the fixed cost per call is a few hundred
+    tokens instead of Claude Code's full default prompt."""
+    from harvey.config import BrainConfig
+    captured = {}
+
+    async def fake_exec(*cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        return _FakeProcess()
+
+    monkeypatch.setattr(brain_mod.asyncio, "create_subprocess_exec", fake_exec)
+    await Brain(state, BrainConfig(model="sonnet", reasoning_effort="low")).think("hi")
+
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("--system-prompt") + 1] == brain_mod.LEAN_SYSTEM_PROMPT
+    assert cmd[cmd.index("--setting-sources") + 1] == ""
+    assert "--no-session-persistence" in cmd
+    assert cmd[cmd.index("--effort") + 1] == "low"
+    assert cmd[cmd.index("--model") + 1] == "sonnet"

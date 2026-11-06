@@ -171,6 +171,15 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
             raise
         logger.error(f"Cannot start — configuration error:\n{e}")
         return
+    if config.outreach.tracks and not config.outreach.allow_heartbeat:
+        # Every entry point (CLI, dashboard Start button, Docker) lands here.
+        logger.error(
+            "Cannot start: this install runs track outreach (outreach.tracks), "
+            "and the heartbeat would prospect and email against `icp` with the "
+            "generic writer. Use `harvey outreach run` / `harvey outreach send`, "
+            "or set outreach.allow_heartbeat: true."
+        )
+        return
     env = load_env()
     state = StateManager()
     brain = Brain(state, config.brain)

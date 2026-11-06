@@ -30,6 +30,17 @@ DEFAULT_MAX_RETRIES = 2  # retries on transient failures (non-zero exit, timeout
 RETRY_BASE_DELAY = 5.0  # seconds; doubles per attempt
 _MAX_ARGV_PROMPT_CHARS = 8000  # longer prompts go via stdin (Windows argv limit)
 
+# Harvey's prompts are self-contained, so the Claude Code default system
+# prompt (tool manuals, environment, the operator's CLAUDE.md, memory and
+# skills: ~13k tokens per call) is replaced by this one line, and no
+# settings sources are loaded. Measured: ~600 fixed input tokens per call
+# instead of ~13,000, same answers.
+LEAN_SYSTEM_PROMPT = (
+    "You are Harvey's writing brain. Answer the prompt directly and return "
+    "exactly the format it asks for, with no preamble."
+)
+CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh")
+
 # stderr fragments that indicate retrying is pointless
 _NON_RETRYABLE_PATTERNS = (
     "not logged in",
@@ -259,7 +270,16 @@ class Brain:
             # the operator's own MCP servers and connectors from loading.
             "--tools", "",
             "--strict-mcp-config",
+            # Lean call: own one-line system prompt, no settings/CLAUDE.md/
+            # skills from the operator's Claude Code, no session file on disk.
+            "--system-prompt", LEAN_SYSTEM_PROMPT,
+            "--setting-sources", "",
+            "--no-session-persistence",
         ]
+        if self.config.reasoning_effort in CLAUDE_EFFORTS:
+            # Drafting a short note needs no deep thinking; "low" cuts output
+            # tokens (thinking is billed as output) by roughly two thirds.
+            cmd += ["--effort", self.config.reasoning_effort]
         if self.model:
             # Validated by BrainConfig; affects this call only, never the
             # operator's own Claude Code settings.
@@ -676,7 +696,7 @@ class Brain:
             "writer": ["email_frameworks", "signal_playbook", "sales_methodology", "offer_strategy", "product_knowledge", "competitive_intel"],
             "handler": ["objection_handling", "sales_methodology", "offer_strategy", "product_knowledge", "competitive_intel"],
             "sender": ["email_frameworks", "product_knowledge"],
-            "linkedin": ["linkedin_outreach", "prospecting_tactics", "product_knowledge"],
+            "outreach": ["product_knowledge", "competitive_intel"],
         }
 
         skill_names = skill_map.get(agent_name, [])

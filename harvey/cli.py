@@ -126,7 +126,16 @@ def cmd_setup(args):
 
 def cmd_run(args):
     """Start Harvey's heartbeat loop."""
+    from harvey.config import load_config
     from harvey.main import main
+
+    outreach_cfg = load_config().outreach
+    if outreach_cfg.tracks and not outreach_cfg.allow_heartbeat:
+        print("\n  This install runs track outreach (outreach.tracks). The heartbeat "
+              "would prospect\n  and email against `icp` with the generic writer, "
+              "so it won't start.\n  Use `harvey outreach run` and `harvey outreach "
+              "send`, or set\n  outreach.allow_heartbeat: true.\n")
+        return
 
     main()
 
@@ -448,6 +457,8 @@ def cmd_outbox(args):
         for item in pending:
             print(f"\n  [{item['id']}] step {item['step']} ({item['kind']}) "
                   f"→ {item['to_email']}  (send {item['send_at'][:16]})")
+            if item.get("error"):
+                print(f"  ⚠ {item['error']}")
             print(f"  Subject: {item['subject']}")
             body_preview = (item["body"][:200] + "...") if len(item["body"]) > 200 else item["body"]
             for line in body_preview.splitlines():
@@ -655,6 +666,218 @@ def cmd_sending(args):
     asyncio.run(_run())
 
 
+def cmd_outreach(args):
+    """Track outreach: find people, draft LinkedIn + email, queue, send."""
+    import csv
+    from harvey.config import load_config, load_env
+    from harvey.state import StateManager
+    from harvey import outreach
+
+    async def _brain(state, config):
+        from harvey.brain import Brain
+        brain = Brain(state, config.brain)
+        problem = await brain.preflight()
+        if problem:
+            print(f"\n  Can't reach the model: {problem}\n")
+            return None
+        return brain
+
+    async def _find(state, config, env):
+        found = await outreach.find_people(
+            state, config, env, track=args.track, queries_per_run=args.queries)
+        for track, n in found.items():
+            print(f"  [{track}] {n} new profile(s)")
+
+    async def _draft(state, config):
+        brain = await _brain(state, config)
+        if brain is None:
+            return False
+        try:
+            c = await outreach.draft_messages(
+                state, brain, config, track=args.track, limit=args.max)
+        except outreach.DraftRunInProgress as e:
+            print(f"  {e}")
+            return False
+        print(f"  Drafted {c['drafted']}, flagged {c['flagged']}, "
+              f"not a fit {c['unfit']}, failed {c['failed']}.")
+        return True
+
+    async def _addresses(state, config, env):
+        if not outreach.has_verifier(env):
+            print("  No email verifier in .env (REOON_API_KEY, ZEROBOUNCE_API_KEY "
+                  "or HUNTER_API_KEY).\n  Without one every address stays a guess "
+                  "and is never sent, so lookups are skipped.")
+            return
+        c = await outreach.find_addresses(
+            state, config, env, track=args.track, limit=args.max)
+        print("  Addresses: " + ", ".join(f"{n} {k}" for k, n in c.items() if n)
+              if any(c.values()) else "  Addresses: nothing to look up.")
+
+    async def _queue(state, config):
+        c = await outreach.queue_emails(state, config, track=args.track)
+        print(f"  Queued {c['queued']} email(s) for approval"
+              + (f"; {c['held_issues']} held with rule issues (see list)"
+                 if c["held_issues"] else "") + ".")
+
+    async def _send(state, config, env):
+        from harvey.agents.handler import Handler
+        from harvey.agents.sender import Sender
+        from harvey.integrations.mail_provider import get_mail_provider
+        if not config.channels.email.enabled:
+            print("  Email is off (channels.email.enabled: false).")
+            return
+        provider = get_mail_provider(config, env)
+        if provider is None or not provider.is_configured():
+            print(f"  Mail provider '{config.channels.email.provider}' isn't "
+                  "configured in .env yet.")
+            return
+        brain = await _brain(state, config)
+        if brain is None:
+            return
+        complete = await Handler(brain, state, config, env).run()
+        if not complete:
+            print("  Replies couldn't all be read, so nothing was sent "
+                  "(a reply must cancel its follow-up first).")
+            return
+        await Sender(brain, state, config, env).run()
+        print(f"  Sent today: {await state.count_outbox_sent_today()}"
+              f"/{config.channels.email.max_daily_sends}.")
+
+    async def _outreach():
+        state = StateManager()
+        await state.init_db()
+        action = args.outreach_action
+        config = load_config()
+        try:
+            outreach.select_tracks(config, args.track)
+        except ValueError as e:
+            print(f"\n  {e}\n")
+            return
+
+        if action in ("find", "draft", "addresses", "queue", "send", "run"):
+            env = load_env()
+            print()
+            if action in ("find", "run"):
+                await _find(state, config, env)
+            if action in ("draft", "run"):
+                if not await _draft(state, config):
+                    return
+            if action in ("addresses", "run"):
+                await _addresses(state, config, env)
+            if action in ("queue", "run"):
+                await _queue(state, config)
+            if action == "send":
+                await _send(state, config, env)
+            nxt = {
+                "find": "harvey outreach draft",
+                "draft": "harvey outreach list, then harvey outreach addresses",
+                "addresses": "harvey outreach queue",
+                "queue": "harvey outbox (approve), then harvey outreach send",
+                "run": "harvey outreach list (LinkedIn) and harvey outbox (email)",
+                "send": "",
+            }[action]
+            print(f"\n  Next: {nxt}\n" if nxt else "")
+            return
+
+        if action == "test":
+            from harvey.integrations.mail_provider import get_mail_provider
+            env = load_env()
+            provider = get_mail_provider(config, env)
+            if provider is None:
+                print(f"\n  No mail provider for '{config.channels.email.provider}'.\n")
+                return
+            ok, detail = await provider.test_connection()
+            print(f"\n  {'OK' if ok else 'FAILED'}: {detail}")
+            print(f"  Search: {'Serper' if env.serper_api_key else 'DuckDuckGo only (throttles)'}"
+                  f" · verifier: {'yes' if outreach.has_verifier(env) else 'none'}\n")
+            return
+
+        if action == "mark":
+            if len(args.mark_args) != 2 or args.mark_args[1] not in (
+                    "sent", "replied", "skipped", "draft"):
+                print("\n  Usage: harvey outreach mark <id> sent|replied|skipped\n")
+                return
+            draft_id, status = args.mark_args
+            draft = await state.get_outreach_draft(draft_id)
+            if draft is None:
+                print("\n  No draft with that id.\n")
+                return
+            await state.set_linkedin_draft_status(draft_id, status)
+            msg = f"Marked LinkedIn {status}."
+            if status == "replied":
+                # Stop-on-reply follows the person, not the channel.
+                await state.update_prospect_status(draft["prospect_id"], "replied")
+                n = await state.cancel_pending_outbox_for_prospect(
+                    draft["prospect_id"], reason="replied on LinkedIn")
+                if n:
+                    msg += f" Cancelled {n} queued email(s)."
+            print(f"\n  {msg}\n")
+            return
+
+        if action == "export":
+            drafts = await state.get_outreach_drafts(
+                status=args.status, track=args.track, limit=5000)
+            with open(args.out, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["id", "track", "linkedin_status", "email_state", "name",
+                            "headline", "company", "linkedin_url", "email",
+                            "email_status", "language", "connect_note",
+                            "first_message", "email_subject", "email_body",
+                            "followup_body", "issues", "email_issues", "fit_reason"])
+                for d in drafts:
+                    w.writerow([d["id"], d["track"], d["status"], d["email_state"],
+                                f"{d['first_name']} {d['last_name']}".strip(),
+                                d["title"], d["company"], d["linkedin_url"],
+                                d["email"], d["email_status"], d["language"],
+                                d["connect_note"], d["first_message"],
+                                d["email_subject"], d["email_body"],
+                                d["followup_body"], d["issues"],
+                                d["email_issues"], d["fit_reason"]])
+            print(f"\n  Wrote {len(drafts)} draft(s) to {args.out}\n")
+            return
+
+        # list
+        counts = await state.count_outreach_drafts()
+        fmt = lambda c: ", ".join(f"{n} {s}" for s, n in sorted(c.items())) or "none"
+        print(f"\n  LinkedIn: {fmt(counts['linkedin'])}")
+        print(f"  Email:    {fmt(counts['email'])}")
+        print("  " + "=" * 60)
+        drafts = await state.get_outreach_drafts(
+            status=args.status or "draft", track=args.track, limit=500)
+        for d in drafts:
+            print(f"\n  [{d['id']}] {d['track']} · {d['first_name']} {d['last_name']}"
+                  f" · {d['title']}" + (f" · {d['company']}" if d["company"] else ""))
+            print(f"  {d['linkedin_url']}")
+            if d["prospect_status"] not in ("track", ""):
+                print(f"  Person is now: {d['prospect_status']}")
+            if d["status"] == "unfit":
+                print(f"  Not a fit: {d['fit_reason']}")
+                continue
+            if d["connect_note"]:
+                if d["issues"]:
+                    print(f"  ⚠ Fix before sending: {d['issues']}")
+                print(f"  Connection note ({len(d['connect_note'])} chars, {d['language']}):")
+                print(f"    {d['connect_note']}")
+                print("  After they accept:")
+                for line in d["first_message"].splitlines():
+                    print(f"    {line}")
+            if d["email_body"]:
+                where = d["email"] or "no address yet"
+                print(f"  Email [{d['email_state'] or 'address not looked up'}] "
+                      f"→ {where}")
+                if d["email_issues"]:
+                    print(f"  ⚠ Held, fix first: {d['email_issues']}")
+                print(f"    Subject: {d['email_subject']}")
+                for line in d["email_body"].splitlines():
+                    print(f"    {line}")
+        if drafts and (args.status or "draft") == "draft":
+            print("\n  Sent a LinkedIn note by hand? harvey outreach mark <id> sent\n")
+        elif not drafts:
+            print("  Nothing here. Run: harvey outreach find, then harvey outreach draft\n")
+
+    asyncio.run(_outreach())
+
+
 def main():
     from harvey.paths import PROJECT_ROOT
     project_root = str(PROJECT_ROOT)
@@ -787,6 +1010,28 @@ def main():
     sub.add_argument("sending_action", nargs="?", default="status",
                      choices=["pause", "resume", "status"])
     sub.set_defaults(func=cmd_sending)
+
+    # harvey outreach
+    sub = subparsers.add_parser(
+        "outreach",
+        help="Track outreach: LinkedIn drafts you send by hand + approved email",
+    )
+    sub.add_argument("outreach_action", nargs="?", default="list",
+                     choices=["find", "draft", "addresses", "queue", "send",
+                              "run", "list", "mark", "export", "test"])
+    sub.add_argument("mark_args", nargs="*", metavar="ID STATUS",
+                     help="For mark: a draft id and sent|replied|skipped")
+    sub.add_argument("--status",
+                     choices=["draft", "sent", "replied", "skipped", "unfit"],
+                     help="Filter list/export by LinkedIn status (list defaults to draft)")
+    sub.add_argument("--track", help="Only this track (e.g. growers, investors, labs)")
+    sub.add_argument("--queries", type=int, default=3,
+                     help="Search queries per track this run (default: 3)")
+    sub.add_argument("--max", type=int, default=10,
+                     help="People to draft or look up this run (default: 10)")
+    sub.add_argument("--out", default="outreach_drafts.csv",
+                     help="Export path (default: outreach_drafts.csv)")
+    sub.set_defaults(func=cmd_outreach)
 
     # harvey usage
     sub = subparsers.add_parser("usage", help="Show brain usage and quota (Claude or Codex)")

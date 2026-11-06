@@ -486,6 +486,32 @@ class Sender:
                 )
                 continue
 
+            # A later step only follows a sent earlier one, in its thread.
+            # (A step with no earlier row in the outbox stands alone.)
+            prior = None
+            if item["kind"] == "sequence" and int(item["step"]) > 1 and item["campaign_id"]:
+                prior = await self.state.get_outbox_step(
+                    item["campaign_id"], item["prospect_id"], int(item["step"]) - 1
+                )
+            if prior is not None:
+                if prior["status"] in ("rejected", "cancelled", "failed"):
+                    await self.state.update_outbox_item(
+                        item["id"],
+                        status="failed" if prior["status"] == "failed" else "cancelled",
+                        error=f"earlier step {prior['status']}: {prior.get('error', '')}"[:300],
+                    )
+                    continue
+                if prior["status"] != "sent":
+                    continue
+                # The earlier step may have gone out earlier in this very
+                # cycle and pushed this one back; trust the stored time.
+                fresh = await self.state.get_outbox_item(item["id"])
+                if fresh is None or (fresh.get("send_at") or "") > now:
+                    continue
+                if not item.get("in_reply_to"):
+                    item = dict(item, in_reply_to=prior.get("message_id", ""),
+                                thread_ref=prior.get("thread_ref", ""))
+
             gate = pre_send_check(
                 item["to_email"], item["subject"], item["body"],
                 prospect=prospect, allow_risky=allow_risky, kind=item["kind"],
@@ -544,6 +570,11 @@ class Sender:
             )
             if prospect.status in ("new", "queued"):
                 await self.state.update_prospect_status(prospect.id, "contacted")
+            if item["kind"] == "sequence" and item["campaign_id"]:
+                await self.state.delay_later_steps(
+                    item["campaign_id"], item["prospect_id"], int(item["step"]),
+                    sent_at=now_iso, scheduled_at=item.get("send_at") or now_iso,
+                )
 
             # A sent reply belongs in its conversation thread.
             if item["kind"] == "reply" and item.get("conversation_id"):

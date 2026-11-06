@@ -1,0 +1,14 @@
+name: only-dev-into-main
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  only-dev-into-main:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse PRs into main that do not come from dev
+        run: |
+          if [ "${{ github.head_ref }}" != "dev" ]; then
+            echo "PRs into main must come from dev (got ${{ github.head_ref }})"; exit 1
+          fi
+          echo ok
